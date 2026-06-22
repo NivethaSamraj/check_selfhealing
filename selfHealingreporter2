@@ -1,171 +1,47 @@
-import fs from 'fs';
-import path from 'path';
-import type {
-  Reporter,
-  FullConfig,
-  Suite,
-  FullResult,
-} from '@playwright/test/reporter';
-import { HealFlow, HealStep } from './types';
-import { renderHtml } from './renderHtml';
-
-/* ------------------------------------------------------------------ *
- *  SelfHealingReporter (Option B — merge BOTH reporting backends)
- *
- *  The framework records flows through TWO independent modules:
- *    - flowTracker.ts -> self-healing-output/flows/flows-{pid}.json
- *        (used by stepRunner.ts: capture / DB / smart resolution)
- *    - sink.ts        -> self-healing-output/shards/flows-{pid}-{ts}.json
- *        (used by fallbackEngine.ts: the AI healing tier)
- *
- *  Previously this reporter read only flows/, so every AI-tier flow
- *  recorded by sink.ts was silently dropped from the dashboard. This
- *  version reads BOTH directories, normalizes the slightly different
- *  flow shapes into the flowTracker-shaped HealFlow that renderHtml +
- *  types.ts expect, and de-duplicates by elementName (latest wins).
- *
- *  Nothing on the test-execution path changes — only the post-run
- *  reporter. Safe for the currently-passing spec.
- * ------------------------------------------------------------------ */
-console.log('=== SelfHealingReporter v4 (merge flows/ + shards/ + themed UI) LOADED ===');
-
-const OUT_DIR = path.join(process.cwd(), 'self-healing-output');
-const FLOW_DIR = path.join(OUT_DIR, 'flows');     // flowTracker.ts
-const SHARD_DIR = path.join(OUT_DIR, 'shards');   // sink.ts
-
-const SHARD_RE = /^flows-.*\.json$/;
-
-export default class SelfHealingReporter implements Reporter {
-  onBegin(_config: FullConfig, _suite: Suite): void {
-    console.log('SELF HEALING REPORTER STARTED [v4 themed]');
-    // Clear stale shards from BOTH dirs so a fresh run never shows old data.
-    for (const dir of [FLOW_DIR, SHARD_DIR]) {
-      try {
-        if (fs.existsSync(dir)) {
-          for (const f of fs.readdirSync(dir)) {
-            if (SHARD_RE.test(f)) fs.unlinkSync(path.join(dir, f));
-          }
-        }
-      } catch {
-        /* best-effort */
-      }
-    }
-    console.log('Old flow files cleared (flows/ + shards/)');
+{
+  "name": "playwright_js",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "run:test": "npx playwright test test_scripts/Homepage.spec.ts --project=chrome",
+    "generate-open-report": "allure generate allure-results --clean -o allure-report && allure open allure-report",
+    "clean:reports": "rimraf allure-report allure-results Screenshots && mkdir allure-report allure-results Screenshots",
+    "tunnel": "LT --user %LT_USERNAME% --key %LT_ACCESS_KEY% --tunnelName test1",
+    "lambda-tests": "npx playwright test test_scripts/SampleSuite.spec.ts --config=./lambdatest.config.ts & npx playwright test report/finalise.spec.ts",
+    "run:show-trace": "npx playwright show-trace test-results",
+    "report": "allure generate allure-results --clean && allure open",
+    "test": "playwright test 2>&1 | tee logs/run.log"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@faker-js/faker": "^8.3.1",
+    "@playwright/test": "^1.59.1",
+    "@reportportal/agent-js-playwright": "^5.2.4",
+    "@types/node": "^20.19.41",
+    "@types/pg": "^8.20.0",
+    "allure-commandline": "^2.38.1",
+    "allure-playwright": "^2.15.1",
+    "jest-allure": "^0.1.3",
+    "ts-morph": "^28.0.0"
+  },
+  "dependencies": {
+    "allure": "^0.0.0",
+    "async-mutex": "^0.5.0",
+    "builder-pattern": "^2.2.0",
+    "chai": "^3.5.0",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "faker": "^5.5.3",
+    "log4js": "^6.9.1",
+    "moment": "^2.30.1",
+    "mutexify": "^1.4.0",
+    "node-xlsx": "^0.23.0",
+    "npm-run-all": "^4.1.5",
+    "openai": "^6.33.0",
+    "pg": "^8.20.0",
+    "rimraf": "^5.0.5"
   }
-
-  onEnd(_result: FullResult): void {
-    const flows = this.readAllFlows();
-    console.log(`FLOW COUNT = ${flows.length}`);
-    if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
-    renderHtml(flows, OUT_DIR);
-    console.log('SELF HEALING REPORTER FINISHED');
-  }
-
-  /**
-   * Read EVERY shard from BOTH flows/ and shards/, normalize the two
-   * flow shapes into the one renderHtml expects, then merge deduped by
-   * elementName (latest endedAt/startedAt wins).
-   */
-  private readAllFlows(): HealFlow[] {
-    const byElement = new Map<string, HealFlow>();
-
-    for (const dir of [FLOW_DIR, SHARD_DIR]) {
-      if (!fs.existsSync(dir)) {
-        console.warn(`Flow dir not found (skipping): ${dir}`);
-        continue;
-      }
-
-      const files = fs.readdirSync(dir).filter((f) => SHARD_RE.test(f));
-      console.log(
-        `[${path.basename(dir)}] ${files.length} shard(s): ${files.join(', ') || '(none)'}`
-      );
-
-      for (const file of files) {
-        const full = path.join(dir, file);
-        try {
-          const raw = fs.readFileSync(full, 'utf-8').trim();
-          if (!raw) continue;
-
-          const parsed = JSON.parse(raw);
-          const arr = Array.isArray(parsed) ? parsed : [];
-          console.log(`Reading: ${file} -> ${arr.length} flow(s)`);
-
-          for (const rawFlow of arr) {
-            const flow = normalizeFlow(rawFlow);
-            if (!flow.elementName) continue;
-
-            const existing = byElement.get(flow.elementName);
-            if (!existing || score(flow) >= score(existing)) {
-              byElement.set(flow.elementName, flow);
-            }
-          }
-        } catch (e) {
-          console.warn(`Skipping unreadable flow file ${full}: ${String(e)}`);
-        }
-      }
-    }
-
-    return Array.from(byElement.values());
-  }
-}
-
-/* ------------------------------------------------------------------ *
- *  Recency score — prefer the most recently finished/started flow when
- *  the same elementName appears in both backends (e.g. an element that
- *  was captured by flowTracker AND later AI-healed via sink).
- *
- *  flowTracker stamps numeric epoch (Date.now()); HealFlow.startedAt is
- *  number, endedAt is number | null. sink stamps ISO strings and has no
- *  endedAt — those arrive raw, so coerce defensively before comparing.
- * ------------------------------------------------------------------ */
-function score(f: HealFlow): number {
-  return toEpoch(f.endedAt) || toEpoch(f.startedAt) || 0;
-}
-
-function toEpoch(v: unknown): number {
-  if (v == null) return 0;
-  if (typeof v === 'number') return v;
-  const t = Date.parse(String(v));
-  return Number.isNaN(t) ? 0 : t;
-}
-
-/* ------------------------------------------------------------------ *
- *  normalizeFlow — coerce either backend's raw flow into the
- *  flowTracker-shaped HealFlow that renderHtml + types.ts expect.
- *
- *  renderHtml reads: elementName, finalTier, finalLocator, healed,
- *  steps[].{order, tier, action, status, locator, durationMs}.
- *
- *  sink flows differ only in metadata names (testName/pageUrl) and in
- *  startedAt being an ISO string. We map names onto testTitle/url and
- *  coerce timestamps to number so the result satisfies HealFlow exactly
- *  (startedAt: number, endedAt: number | null, no `confidence` on steps —
- *  any confidence value carried by AI-tier steps is intentionally dropped
- *  since HealStep / renderHtml do not surface it).
- * ------------------------------------------------------------------ */
-function normalizeFlow(f: any): HealFlow {
-  const steps: HealStep[] = Array.isArray(f?.steps)
-    ? f.steps.map((s: any, i: number) => ({
-        order: s?.order ?? i + 1,
-        tier: s?.tier,
-        action: s?.action,
-        status: s?.status,
-        locator: s?.locator,
-        reason: s?.reason,
-        durationMs: s?.durationMs,
-      }))
-    : [];
-
-  return {
-    elementName: f?.elementName,
-    testTitle: f?.testTitle ?? f?.testName ?? '',
-    url: f?.url ?? f?.pageUrl ?? '',
-    steps,
-    finalTier: f?.finalTier ?? null,
-    finalLocator: f?.finalLocator ?? null,
-    healed: !!f?.healed,
-    writtenBack: !!f?.writtenBack,
-    startedAt: toEpoch(f?.startedAt),
-    endedAt: f?.endedAt == null ? null : toEpoch(f?.endedAt),
-  };
 }
