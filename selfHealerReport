@@ -1,0 +1,82 @@
+import fs from 'fs';
+import path from 'path';
+import type {
+  Reporter,
+  FullConfig,
+  Suite,
+  FullResult,
+} from '@playwright/test/reporter';
+import { HealFlow } from './types';
+import { renderHtml } from './renderHtml';
+
+/* ------------------------------------------------------------------ *
+ *  SelfHealingReporter
+ *
+ *  Merges every per-worker flow shard (self-healing-output/flows/flows-*.json),
+ *  de-duplicates by elementName, and renders the dashboard via renderHtml
+ *  (the original dark/light themed report).
+ * ------------------------------------------------------------------ */
+
+console.log('=== SelfHealingReporter v3 (merge-all-shards + themed UI) LOADED ===');
+
+const OUT_DIR = path.join(process.cwd(), 'self-healing-output');
+const FLOW_DIR = path.join(OUT_DIR, 'flows');
+
+export default class SelfHealingReporter implements Reporter {
+  onBegin(_config: FullConfig, _suite: Suite): void {
+    console.log('SELF HEALING REPORTER STARTED [v3 themed]');
+    try {
+      if (fs.existsSync(FLOW_DIR)) {
+        for (const f of fs.readdirSync(FLOW_DIR)) {
+          if (/^flows-.*\.json$/.test(f)) fs.unlinkSync(path.join(FLOW_DIR, f));
+        }
+      }
+      console.log('Old flow files cleared');
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  onEnd(_result: FullResult): void {
+    const flows = this.readAllFlows();
+    console.log(`FLOW COUNT = ${flows.length}`);
+    if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
+    renderHtml(flows, OUT_DIR);
+    console.log('SELF HEALING REPORTER FINISHED');
+  }
+
+  /** Read EVERY flows-*.json shard and merge, deduped by elementName. */
+  private readAllFlows(): HealFlow[] {
+    const byElement = new Map<string, HealFlow>();
+    if (!fs.existsSync(FLOW_DIR)) {
+      console.warn(`Flow dir not found: ${FLOW_DIR}`);
+      return [];
+    }
+
+    const files = fs.readdirSync(FLOW_DIR).filter((f) => /^flows-.*\.json$/.test(f));
+    console.log(`Found ${files.length} flow shard(s): ${files.join(', ') || '(none)'}`);
+
+    for (const file of files) {
+      const full = path.join(FLOW_DIR, file);
+      try {
+        const raw = fs.readFileSync(full, 'utf-8').trim();
+        if (!raw) continue;
+        const parsed = JSON.parse(raw) as HealFlow[];
+        const arr = Array.isArray(parsed) ? parsed : [];
+        console.log(`Reading: ${file} -> ${arr.length} flow(s)`);
+        for (const flow of arr) {
+          if (!flow?.elementName) continue;
+          const existing = byElement.get(flow.elementName);
+          const score = (f: HealFlow) => (f.endedAt ?? f.startedAt ?? 0);
+          if (!existing || score(flow) >= score(existing)) {
+            byElement.set(flow.elementName, flow);
+          }
+        }
+      } catch (e) {
+        console.warn(`Skipping unreadable flow file ${file}: ${String(e)}`);
+      }
+    }
+
+    return Array.from(byElement.values());
+  }
+}
