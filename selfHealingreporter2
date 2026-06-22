@@ -6,7 +6,7 @@ import type {
   Suite,
   FullResult,
 } from '@playwright/test/reporter';
-import { HealFlow } from './types';
+import { HealFlow, HealStep } from './types';
 import { renderHtml } from './renderHtml';
 
 /* ------------------------------------------------------------------ *
@@ -21,7 +21,8 @@ import { renderHtml } from './renderHtml';
  *  Previously this reporter read only flows/, so every AI-tier flow
  *  recorded by sink.ts was silently dropped from the dashboard. This
  *  version reads BOTH directories, normalizes the slightly different
- *  flow shapes, and de-duplicates by elementName (latest wins).
+ *  flow shapes into the flowTracker-shaped HealFlow that renderHtml +
+ *  types.ts expect, and de-duplicates by elementName (latest wins).
  *
  *  Nothing on the test-execution path changes — only the post-run
  *  reporter. Safe for the currently-passing spec.
@@ -75,7 +76,9 @@ export default class SelfHealingReporter implements Reporter {
       }
 
       const files = fs.readdirSync(dir).filter((f) => SHARD_RE.test(f));
-      console.log(`[${path.basename(dir)}] ${files.length} shard(s): ${files.join(', ') || '(none)'}`);
+      console.log(
+        `[${path.basename(dir)}] ${files.length} shard(s): ${files.join(', ') || '(none)'}`
+      );
 
       for (const file of files) {
         const full = path.join(dir, file);
@@ -89,7 +92,7 @@ export default class SelfHealingReporter implements Reporter {
 
           for (const rawFlow of arr) {
             const flow = normalizeFlow(rawFlow);
-            if (!flow?.elementName) continue;
+            if (!flow.elementName) continue;
 
             const existing = byElement.get(flow.elementName);
             if (!existing || score(flow) >= score(existing)) {
@@ -111,12 +114,12 @@ export default class SelfHealingReporter implements Reporter {
  *  the same elementName appears in both backends (e.g. an element that
  *  was captured by flowTracker AND later AI-healed via sink).
  *
- *  flowTracker uses numeric epoch (startedAt/endedAt: Date.now()).
- *  sink uses ISO strings (startedAt: new Date().toISOString()) and has
- *  no endedAt. Coerce both to a comparable number.
+ *  flowTracker stamps numeric epoch (Date.now()); HealFlow.startedAt is
+ *  number, endedAt is number | null. sink stamps ISO strings and has no
+ *  endedAt — those arrive raw, so coerce defensively before comparing.
  * ------------------------------------------------------------------ */
-function score(f: any): number {
-  return toEpoch(f?.endedAt) || toEpoch(f?.startedAt) || 0;
+function score(f: HealFlow): number {
+  return toEpoch(f.endedAt) || toEpoch(f.startedAt) || 0;
 }
 
 function toEpoch(v: unknown): number {
@@ -127,40 +130,42 @@ function toEpoch(v: unknown): number {
 }
 
 /* ------------------------------------------------------------------ *
- *  normalizeFlow — reconcile the two HealFlow shapes into the single
- *  shape renderHtml consumes. renderHtml reads:
- *    flow.elementName, flow.finalTier, flow.finalLocator, flow.healed,
- *    flow.steps[].{order, tier, action, status, locator, durationMs}
+ *  normalizeFlow — coerce either backend's raw flow into the
+ *  flowTracker-shaped HealFlow that renderHtml + types.ts expect.
  *
- *  flowTracker flows already match. sink flows differ only in metadata
- *  field names (testName/pageUrl vs testTitle/url), which renderHtml
- *  does not read — but we map them anyway so the object is consistent
- *  and future report tweaks don't silently miss them.
+ *  renderHtml reads: elementName, finalTier, finalLocator, healed,
+ *  steps[].{order, tier, action, status, locator, durationMs}.
+ *
+ *  sink flows differ only in metadata names (testName/pageUrl) and in
+ *  startedAt being an ISO string. We map names onto testTitle/url and
+ *  coerce timestamps to number so the result satisfies HealFlow exactly
+ *  (startedAt: number, endedAt: number | null, no `confidence` on steps —
+ *  any confidence value carried by AI-tier steps is intentionally dropped
+ *  since HealStep / renderHtml do not surface it).
  * ------------------------------------------------------------------ */
 function normalizeFlow(f: any): HealFlow {
+  const steps: HealStep[] = Array.isArray(f?.steps)
+    ? f.steps.map((s: any, i: number) => ({
+        order: s?.order ?? i + 1,
+        tier: s?.tier,
+        action: s?.action,
+        status: s?.status,
+        locator: s?.locator,
+        reason: s?.reason,
+        durationMs: s?.durationMs,
+      }))
+    : [];
+
   return {
     elementName: f?.elementName,
-    // Map sink's (testName/pageUrl) onto flowTracker's (testTitle/url),
-    // keeping whichever is present.
     testTitle: f?.testTitle ?? f?.testName ?? '',
     url: f?.url ?? f?.pageUrl ?? '',
-    steps: Array.isArray(f?.steps)
-      ? f.steps.map((s: any, i: number) => ({
-          order: s?.order ?? i + 1,
-          tier: s?.tier,
-          action: s?.action,
-          status: s?.status,
-          locator: s?.locator,
-          reason: s?.reason,
-          confidence: s?.confidence,
-          durationMs: s?.durationMs,
-        }))
-      : [],
+    steps,
     finalTier: f?.finalTier ?? null,
     finalLocator: f?.finalLocator ?? null,
     healed: !!f?.healed,
     writtenBack: !!f?.writtenBack,
-    startedAt: f?.startedAt ?? null,
-    endedAt: f?.endedAt ?? null,
-  } as HealFlow;
+    startedAt: toEpoch(f?.startedAt),
+    endedAt: f?.endedAt == null ? null : toEpoch(f?.endedAt),
+  };
 }
