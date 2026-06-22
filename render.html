@@ -1,0 +1,323 @@
+import fs from "fs";
+import path from "path";
+import { HealFlow } from "./types";
+
+/**
+ * Self-Healing Flow Dashboard
+ * ---------------------------
+ * Renders the dark/light themed dashboard (resilience ring, tier-distribution
+ * bar, stat cards, grouped timeline, expandable detail rows) from the live
+ * `flows[]` array. Every figure is derived from the data — nothing hardcoded.
+ */
+
+const esc = (s?: string | number | null) =>
+  String(s ?? "—")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+const displayNames: Record<string, string> = {
+  continue_shopping: "Dismiss Welcome Popup",
+  search_toggle: "Open Product Search",
+  search_input: "Enter Search Criteria",
+  dress_product: "Select Product",
+  dress_size: "Choose Size",
+  add_to_bag: "Add Product To Bag",
+  mini_cart_open: "Open Shopping Bag",
+  verify_cart: "Verify Cart Contents",
+};
+
+const TIER_META = {
+  db: { label: "DB Primary", color: "#2DD4A7" },
+  smart: { label: "Smart Locator", color: "#F4B740" },
+  ai: { label: "AI Healed", color: "#FF6B6B" },
+  unresolved: { label: "Unresolved", color: "#6B7A99" },
+} as const;
+
+type TierKey = keyof typeof TIER_META;
+
+function pct(n: number, total: number): number {
+  return total === 0 ? 0 : Math.round((n / total) * 1000) / 10;
+}
+
+export function renderHtml(flows: HealFlow[], outDir: string): string {
+  const total = flows.length;
+
+  const count = (t: string) => flows.filter((f) => f.finalTier === t).length;
+  const dbN = count("db");
+  const smartN = count("smart");
+  const aiN = count("ai");
+  const unresolvedN = flows.filter((f) => !f.finalTier).length;
+
+  const healedN = flows.filter((f) => f.healed).length;
+  const resolvedN = total - unresolvedN;
+
+  const resilience = pct(resolvedN, total);
+
+  const totalMs = flows.reduce(
+    (a, f) => a + (f.steps?.reduce((s, st) => s + (st.durationMs ?? 0), 0) ?? 0),
+    0
+  );
+
+  const distOrder: TierKey[] = ["db", "smart", "ai", "unresolved"];
+  const distSegments = distOrder
+    .map((k) => {
+      const n =
+        k === "unresolved" ? unresolvedN : k === "db" ? dbN : k === "smart" ? smartN : aiN;
+      const w = pct(n, total);
+      if (w === 0) return "";
+      return `<div class="seg" style="width:${w}%;background:${TIER_META[k].color}" title="${TIER_META[k].label}: ${n}">${
+        w >= 8 ? `<span>${n}</span>` : ""
+      }</div>`;
+    })
+    .join("");
+
+  const distLegend = distOrder
+    .map((k) => {
+      const n =
+        k === "unresolved" ? unresolvedN : k === "db" ? dbN : k === "smart" ? smartN : aiN;
+      return `<li><span class="dot" style="background:${TIER_META[k].color}"></span>${TIER_META[k].label}<b>${n}</b></li>`;
+    })
+    .join("");
+
+  const rows = flows
+    .map((f, i) => {
+      const tier = (f.finalTier ?? "unresolved") as TierKey;
+      const meta = TIER_META[tier] ?? TIER_META.unresolved;
+      const displayName = displayNames[f.elementName] ?? f.elementName;
+
+      const stepRows = (f.steps ?? [])
+        .map(
+          (s, si) => `<tr>
+        <td>${(s as any).order ?? si + 1}</td>
+        <td><span class="mini ${s.tier}">${esc(s.tier)}</span></td>
+        <td>${esc(s.action)}</td>
+        <td class="st-${s.status}">${esc(s.status)}</td>
+        <td class="loc">${esc(s.locator)}</td>
+        <td>${s.durationMs != null ? s.durationMs + " ms" : "—"}</td>
+      </tr>`
+        )
+        .join("");
+
+      return `<tr class="main" data-row="${i}">
+        <td class="ix">${String(i + 1).padStart(2, "0")}</td>
+        <td class="el">${esc(displayName)}</td>
+        <td><span class="tier" style="background:${meta.color}1f;color:${meta.color}">${meta.label}</span></td>
+        <td>${f.healed ? `<span class="yes">Healed</span>` : `<span class="no">—</span>`}</td>
+        <td class="loc">${esc(f.finalLocator)}</td>
+        <td class="exp">▾</td>
+      </tr>
+      <tr class="detail" data-detail="${i}">
+        <td colspan="8">
+          <table class="steps">
+            <thead><tr><th>#</th><th>Tier</th><th>Action</th><th>Status</th><th>Locator</th><th>Duration</th></tr></thead>
+            <tbody>${stepRows || `<tr><td colspan="6" class="empty">No steps recorded</td></tr>`}</tbody>
+          </table>
+        </td>
+      </tr>`;
+    })
+    .join("");
+
+  const generated = new Date().toLocaleString();
+
+  const html = `<!doctype html><html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Self-Healing Flow Report</title>
+<style>
+  :root{
+    --bg:#0B1220; --panel:#111B2E; --panel-2:#0E1626; --line:#1E2B45;
+    --ink:#E8EEF7; --muted:#8DA0BF; --faint:#5C6E8C;
+    --db:#2DD4A7; --smart:#F4B740; --ai:#FF6B6B; --unres:#6B7A99;
+    --accent:#5B8DEF;
+    --mono:'JetBrains Mono','SF Mono',ui-monospace,Menlo,Consolas,monospace;
+    --sans:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
+  }
+    body.light{
+  --bg:#F5F7FB;
+  --panel:#FFFFFF;
+  --panel-2:#F8FAFD;
+  --line:#DCE4F0;
+  --ink:#18263A;
+  --muted:#5E718F;
+  --faint:#8B9AB3;
+  --accent:#3563E9;
+}
+  *{box-sizing:border-box}
+  body{margin:0;background:
+    radial-gradient(1200px 600px at 85% -10%,#16243f 0%,transparent 55%),
+    var(--bg);
+    color:var(--ink);font-family:var(--sans);
+    -webkit-font-smoothing:antialiased;padding:20px;line-height:1.5}
+  .topbar{display:flex;align-items:flex-end;justify-content:space-between;
+    flex-wrap:wrap;gap:16px;margin-bottom:30px}
+  .brand{display:flex;flex-direction:column;gap:6px}
+  .brand .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.32em;
+    color:var(--db);text-transform:uppercase}
+  .brand h1{margin:0;font-size:30px;font-weight:700;letter-spacing:-.01em}
+  .brand .sub{color:var(--muted);font-size:14px}
+  .gen{font-family:var(--mono);font-size:12px;color:var(--faint);text-align:right}
+  .hero{display:grid;grid-template-columns:280px 1fr;gap:22px;margin-bottom:22px}
+  @media(max-width:860px){.hero{grid-template-columns:1fr}}
+  .score{background:linear-gradient(160deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:18px;padding:26px;
+    display:flex;flex-direction:column;justify-content:center;align-items:center;
+    position:relative;overflow:hidden}
+  .ring{position:relative;width:180px;height:180px}
+  .ring svg{transform:rotate(-90deg)}
+  .ring .val{position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center}
+  .ring .num{font-size:46px;font-weight:700;letter-spacing:-.02em}
+  .ring .num small{font-size:20px;color:var(--muted)}
+  .ring .cap{font-family:var(--mono);font-size:11px;letter-spacing:.18em;
+    color:var(--muted);text-transform:uppercase;margin-top:2px}
+  .dist{background:linear-gradient(160deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:18px;padding:24px 26px;
+    display:flex;flex-direction:column;gap:18px}
+  .dist h3{margin:0;font-size:13px;font-family:var(--mono);letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted);font-weight:600}
+  .bar{display:flex;height:46px;border-radius:11px;overflow:hidden;
+    background:#0a0f1c;border:1px solid var(--line)}
+  .bar .seg{display:flex;align-items:center;justify-content:center;
+    color:#06121b;font-weight:700;font-size:13px;transition:width .6s ease;min-width:2px}
+  .bar .seg span{padding:0 4px}
+  .legend{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:20px}
+  .legend li{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+  .legend b{color:var(--ink);font-size:15px;margin-left:2px}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:26px}
+  @media(max-width:1100px){.stats{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:560px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:18px 18px 16px}
+  .stat .v{font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1}
+  .stat .l{color:var(--muted);font-size:12.5px;margin-top:8px}
+  .stat.accent .v{color:var(--db)}
+  .section-h{font-family:var(--mono);font-size:12px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--muted);margin:30px 0 14px}
+  .top-actions{display:flex;align-items:center;gap:12px;}
+  .theme-btn{border:none;cursor:pointer;padding:10px 16px;border-radius:10px;
+    background:var(--panel);color:var(--ink);border:1px solid var(--line);
+    font-weight:600;transition:.2s;}
+  .theme-btn:hover{transform:translateY(-1px);}
+  .panel{width:100%;max-width:100%;}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+  table.main-t{width:100%;border-collapse:collapse}
+  table.main-t thead th{background:#0c1424;color:var(--muted);text-align:left;
+    padding:14px 16px;font-size:11.5px;font-family:var(--mono);letter-spacing:.1em;
+    text-transform:uppercase;font-weight:600;border-bottom:1px solid var(--line)}
+  table.main-t td{padding:13px 16px;border-bottom:1px solid var(--line);font-size:13.5px;
+    vertical-align:middle}
+  tr.main{cursor:pointer;transition:background .15s}
+  tr.main:hover{background:#0f1a2e}
+  td.ix{font-family:var(--mono);color:var(--faint);font-size:12px}
+  td.el{font-weight:600}
+  td.tc{color:var(--muted);font-size:12.5px}
+  td.loc{font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  td.exp{color:var(--faint);text-align:center;width:30px;transition:transform .2s}
+  tr.main.open td.exp{transform:rotate(180deg);color:var(--accent)}
+  .tier{padding:5px 11px;border-radius:20px;font-size:11.5px;font-weight:700;
+    font-family:var(--mono);letter-spacing:.04em;white-space:nowrap}
+  .yes{color:var(--db);font-weight:600;font-size:12.5px}
+  .no{color:var(--faint)}
+  tr.detail{display:none}
+  tr.detail.show{display:table-row}
+  tr.detail td{background:var(--panel-2);padding:0 16px 14px}
+  table.steps{width:100%;border-collapse:collapse;margin:6px 0 4px}
+  table.steps th{background:transparent;color:var(--faint);text-align:left;
+    padding:9px 12px;font-size:10.5px;font-family:var(--mono);letter-spacing:.08em;
+    text-transform:uppercase;border-bottom:1px solid var(--line)}
+  table.steps td{padding:9px 12px;font-size:12px;border-bottom:1px solid #16223a}
+  .mini{font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:5px;
+    text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+  .mini.db{background:#2DD4A722;color:var(--db)}
+  .mini.smart{background:#F4B74022;color:var(--smart)}
+  .mini.ai{background:#FF6B6B22;color:var(--ai)}
+  .st-success{color:var(--db)} .st-failed{color:var(--ai)} .st-skipped{color:var(--faint)}
+  .empty{color:var(--faint);text-align:center;padding:14px}
+  .foot{margin-top:26px;color:var(--faint);font-size:12px;font-family:var(--mono);
+    text-align:center;letter-spacing:.04em}
+</style></head><body>
+  <div class="topbar">
+    <div class="brand">
+      <span class="kicker">Knitwell · Self-Healing</span>
+      <h1>Flow Resolution Dashboard</h1>
+      <span class="sub">Live results from the three-tier fallback chain — DB primary → smart locators → AI healing</span>
+    </div>
+    <div class="top-actions">
+      <button id="themeToggle" class="theme-btn">🌙 Dark mode</button>
+      <div class="gen">Generated<br>${esc(generated)}</div>
+    </div>
+  </div>
+  <div class="hero">
+    <div class="score">
+      <div class="ring">
+        <svg width="180" height="180" viewBox="0 0 180 180">
+          <circle cx="90" cy="90" r="78" fill="none" stroke="#1a2740" stroke-width="14"/>
+          <circle cx="90" cy="90" r="78" fill="none" stroke="url(#g)" stroke-width="14"
+            stroke-linecap="round" stroke-dasharray="${(490 * resilience) / 100} 490"/>
+          <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#2DD4A7"/><stop offset="1" stop-color="#5B8DEF"/>
+          </linearGradient></defs>
+        </svg>
+        <div class="val">
+          <div class="num">${resilience}<small>%</small></div>
+          <div class="cap">Resilience</div>
+        </div>
+      </div>
+    </div>
+    <div class="dist">
+      <h3>Tier Distribution · ${total} elements</h3>
+      <div class="bar">${distSegments || '<div class="seg" style="width:100%;background:#1a2740"></div>'}</div>
+      <ul class="legend">${distLegend}</ul>
+    </div>
+  </div>
+  <div class="stats">
+  <div class="stat"><div class="v">${total}</div><div class="l">Total Elements</div></div>
+  <div class="stat accent"><div class="v">${dbN}</div><div class="l">DB Resolved</div></div>
+  <div class="stat"><div class="v">${smartN}</div><div class="l">Smart Healed</div></div>
+  <div class="stat"><div class="v">${aiN}</div><div class="l">AI Healed</div></div>
+  <div class="stat"><div class="v">${unresolvedN}</div><div class="l">Unresolved</div></div>
+  <div class="stat"><div class="v">${resilience}%</div><div class="l">Resilience Score</div></div>
+</div>
+  <div class="section-h">Element Detail · click a row to expand its tier trace</div>
+  <div class="panel">
+    <table class="main-t">
+      <thead><tr><th>#</th><th>Element</th><th>Final Tier</th><th>Healed</th><th>Final Locator</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="empty">No elements captured in this run.</td></tr>'}</tbody>
+    </table>
+  </div>
+ <div class="foot">${resolvedN}/${total} resolved · ${healedN} healed · ${totalMs} ms total execution time</div>
+<script>
+const savedTheme = localStorage.getItem('dashboard-theme');
+if(savedTheme === 'light'){ document.body.classList.add('light'); }
+const btn = document.getElementById('themeToggle');
+function updateThemeButton(){
+  btn.textContent = document.body.classList.contains('light') ? '☀️ Light mode' : '🌙 Dark mode';
+}
+updateThemeButton();
+btn.addEventListener('click', () => {
+  document.body.classList.toggle('light');
+  localStorage.setItem('dashboard-theme', document.body.classList.contains('light') ? 'light' : 'dark');
+  updateThemeButton();
+});
+document.querySelectorAll('tr.main').forEach(function(r){
+  r.addEventListener('click',function(){
+    var i=r.getAttribute('data-row');
+    var d=document.querySelector('tr.detail[data-detail="'+i+'"]');
+    if(!d)return;
+    r.classList.toggle('open');
+    d.classList.toggle('show');
+  });
+});
+</script>
+</body></html>`;
+
+  fs.writeFileSync(path.join(outDir, "report-data.json"), JSON.stringify(flows, null, 2));
+  const out = path.join(outDir, "index.html");
+  fs.writeFileSync(out, html);
+  console.log("Dashboard created:", out);
+  return out;
+}
