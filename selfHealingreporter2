@@ -1,0 +1,166 @@
+import fs from 'fs';
+import path from 'path';
+import type {
+  Reporter,
+  FullConfig,
+  Suite,
+  FullResult,
+} from '@playwright/test/reporter';
+import { HealFlow } from './types';
+import { renderHtml } from './renderHtml';
+
+/* ------------------------------------------------------------------ *
+ *  SelfHealingReporter (Option B — merge BOTH reporting backends)
+ *
+ *  The framework records flows through TWO independent modules:
+ *    - flowTracker.ts -> self-healing-output/flows/flows-{pid}.json
+ *        (used by stepRunner.ts: capture / DB / smart resolution)
+ *    - sink.ts        -> self-healing-output/shards/flows-{pid}-{ts}.json
+ *        (used by fallbackEngine.ts: the AI healing tier)
+ *
+ *  Previously this reporter read only flows/, so every AI-tier flow
+ *  recorded by sink.ts was silently dropped from the dashboard. This
+ *  version reads BOTH directories, normalizes the slightly different
+ *  flow shapes, and de-duplicates by elementName (latest wins).
+ *
+ *  Nothing on the test-execution path changes — only the post-run
+ *  reporter. Safe for the currently-passing spec.
+ * ------------------------------------------------------------------ */
+console.log('=== SelfHealingReporter v4 (merge flows/ + shards/ + themed UI) LOADED ===');
+
+const OUT_DIR = path.join(process.cwd(), 'self-healing-output');
+const FLOW_DIR = path.join(OUT_DIR, 'flows');     // flowTracker.ts
+const SHARD_DIR = path.join(OUT_DIR, 'shards');   // sink.ts
+
+const SHARD_RE = /^flows-.*\.json$/;
+
+export default class SelfHealingReporter implements Reporter {
+  onBegin(_config: FullConfig, _suite: Suite): void {
+    console.log('SELF HEALING REPORTER STARTED [v4 themed]');
+    // Clear stale shards from BOTH dirs so a fresh run never shows old data.
+    for (const dir of [FLOW_DIR, SHARD_DIR]) {
+      try {
+        if (fs.existsSync(dir)) {
+          for (const f of fs.readdirSync(dir)) {
+            if (SHARD_RE.test(f)) fs.unlinkSync(path.join(dir, f));
+          }
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+    console.log('Old flow files cleared (flows/ + shards/)');
+  }
+
+  onEnd(_result: FullResult): void {
+    const flows = this.readAllFlows();
+    console.log(`FLOW COUNT = ${flows.length}`);
+    if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
+    renderHtml(flows, OUT_DIR);
+    console.log('SELF HEALING REPORTER FINISHED');
+  }
+
+  /**
+   * Read EVERY shard from BOTH flows/ and shards/, normalize the two
+   * flow shapes into the one renderHtml expects, then merge deduped by
+   * elementName (latest endedAt/startedAt wins).
+   */
+  private readAllFlows(): HealFlow[] {
+    const byElement = new Map<string, HealFlow>();
+
+    for (const dir of [FLOW_DIR, SHARD_DIR]) {
+      if (!fs.existsSync(dir)) {
+        console.warn(`Flow dir not found (skipping): ${dir}`);
+        continue;
+      }
+
+      const files = fs.readdirSync(dir).filter((f) => SHARD_RE.test(f));
+      console.log(`[${path.basename(dir)}] ${files.length} shard(s): ${files.join(', ') || '(none)'}`);
+
+      for (const file of files) {
+        const full = path.join(dir, file);
+        try {
+          const raw = fs.readFileSync(full, 'utf-8').trim();
+          if (!raw) continue;
+
+          const parsed = JSON.parse(raw);
+          const arr = Array.isArray(parsed) ? parsed : [];
+          console.log(`Reading: ${file} -> ${arr.length} flow(s)`);
+
+          for (const rawFlow of arr) {
+            const flow = normalizeFlow(rawFlow);
+            if (!flow?.elementName) continue;
+
+            const existing = byElement.get(flow.elementName);
+            if (!existing || score(flow) >= score(existing)) {
+              byElement.set(flow.elementName, flow);
+            }
+          }
+        } catch (e) {
+          console.warn(`Skipping unreadable flow file ${full}: ${String(e)}`);
+        }
+      }
+    }
+
+    return Array.from(byElement.values());
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  Recency score — prefer the most recently finished/started flow when
+ *  the same elementName appears in both backends (e.g. an element that
+ *  was captured by flowTracker AND later AI-healed via sink).
+ *
+ *  flowTracker uses numeric epoch (startedAt/endedAt: Date.now()).
+ *  sink uses ISO strings (startedAt: new Date().toISOString()) and has
+ *  no endedAt. Coerce both to a comparable number.
+ * ------------------------------------------------------------------ */
+function score(f: any): number {
+  return toEpoch(f?.endedAt) || toEpoch(f?.startedAt) || 0;
+}
+
+function toEpoch(v: unknown): number {
+  if (v == null) return 0;
+  if (typeof v === 'number') return v;
+  const t = Date.parse(String(v));
+  return Number.isNaN(t) ? 0 : t;
+}
+
+/* ------------------------------------------------------------------ *
+ *  normalizeFlow — reconcile the two HealFlow shapes into the single
+ *  shape renderHtml consumes. renderHtml reads:
+ *    flow.elementName, flow.finalTier, flow.finalLocator, flow.healed,
+ *    flow.steps[].{order, tier, action, status, locator, durationMs}
+ *
+ *  flowTracker flows already match. sink flows differ only in metadata
+ *  field names (testName/pageUrl vs testTitle/url), which renderHtml
+ *  does not read — but we map them anyway so the object is consistent
+ *  and future report tweaks don't silently miss them.
+ * ------------------------------------------------------------------ */
+function normalizeFlow(f: any): HealFlow {
+  return {
+    elementName: f?.elementName,
+    // Map sink's (testName/pageUrl) onto flowTracker's (testTitle/url),
+    // keeping whichever is present.
+    testTitle: f?.testTitle ?? f?.testName ?? '',
+    url: f?.url ?? f?.pageUrl ?? '',
+    steps: Array.isArray(f?.steps)
+      ? f.steps.map((s: any, i: number) => ({
+          order: s?.order ?? i + 1,
+          tier: s?.tier,
+          action: s?.action,
+          status: s?.status,
+          locator: s?.locator,
+          reason: s?.reason,
+          confidence: s?.confidence,
+          durationMs: s?.durationMs,
+        }))
+      : [],
+    finalTier: f?.finalTier ?? null,
+    finalLocator: f?.finalLocator ?? null,
+    healed: !!f?.healed,
+    writtenBack: !!f?.writtenBack,
+    startedAt: f?.startedAt ?? null,
+    endedAt: f?.endedAt ?? null,
+  } as HealFlow;
+}
