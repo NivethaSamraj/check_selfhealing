@@ -1,0 +1,122 @@
+# Self-Healing Test Automation Framework (Knitwell / AFTA)
+
+## Summary
+
+This PR introduces a complete three-tier self-healing locator engine for the
+Playwright/TypeScript automation suite, plus a flow-resolution dashboard. When
+a locator breaks, the framework resolves it automatically — falling back from
+the stored primary locator, to generated smart locators, to AI-generated
+locators — instead of failing the test. Every resolution is recorded and
+rendered in a dashboard so healing behaviour is auditable.
+
+Validated end-to-end against the Ann Taylor (EShopWorld) storefront funnel:
+homepage → search → product → bag.
+
+---
+
+## Motivation
+
+Retail storefronts (Ann Taylor, Talbots, Chico's) change markup frequently —
+ids flip between renders, classes are framework-generated, the same logical
+control renders twice (mobile + desktop twins). Hard-coded locators rot fast.
+This framework keeps tests green across those changes without manual locator
+maintenance, and makes every auto-repair visible for review.
+
+---
+
+## What's included
+
+### 1. Three-tier resolution engine (`fallbackEngine.ts`)
+
+Per element, in order:
+
+1. **DB primary** — the stored primary locator.
+2. **Smart locators** — role → testId → label → placeholder → text → alt →
+   title → css → xpath, tried in priority order.
+3. **AI healing** — GPT-4.1 (Azure OpenAI) generates a locator from live DOM +
+   screenshots.
+
+Supporting logic added here:
+
+- **Locator-string parser** (`buildLocator` / `buildBaseLocator`) that
+  reconstructs Playwright locators from stored strings, including:
+  - `getByRole` with **regex-name** form (`{ name: /…/i }`), which the original
+    parser couldn't handle and which crashed the CSS path.
+  - Playwright selector suffixes: `>> nth=N`, `>> visible=true`, and `:visible`.
+- **Twin-aware validation** (`isValidLocator`): a locator matching several
+  elements is still valid if exactly one is visible (mobile/desktop twin), and
+  a "soft match" (several visible sharing one accessible name, e.g. product-card
+  image + title + quick-view) is accepted with `.first()` and logged loudly for
+  audit.
+- **`resolveToSingle`** narrows twins/soft-matches to the visible/first match.
+
+### 2. Smart-locator generation (`selfHealing.ts`)
+
+- Extracts element metadata + ancestor/sibling chains.
+- Generates the full smart-locator bundle, each candidate uniqueness-checked
+  with the twin-aware verdict (`unique` / `visible-one` / `no`).
+- **Dynamic-value rejection**: UUIDs, long hashes, framework-generated ids
+  (`react`/`mui`/`mat`/`cdk`/`ng` + digits), indexed/positional XPath are all
+  refused so generated locators stay stable.
+- Notably drops bare `id` as a preferred CSS strategy (Ann Taylor's search
+  input id flips between renders); id survives only as a gated last-resort
+  XPath candidate.
+- Captures element + full-page screenshots (JPEG q70) and a minimized DOM for
+  the AI tier.
+
+### 3. AI healing tier (`aiHealing.ts`)
+
+- Multimodal Azure OpenAI call: DOM-as-text prompt + **real image blocks**
+  (old element, old page, current page), not pasted base64.
+- `imageBlock` returns `null` for missing screenshots so empty/"Not available"
+  blocks are never sent; reference images use `low` detail, the current page
+  uses `high` (token-cost control).
+- Strict-JSON contract with markdown-fence stripping before parse.
+- Confidence threshold (≥0.7) and dynamic-locator rejection on the AI result.
+
+### 4. Orchestration + resilience (`stepRunner.ts`)
+
+- `step()` routes each element through capture → DB/smart → AI heal.
+- **`CAPTURE_MODE`** learning run: captures every element against a fresh DB
+  without resolving or healing.
+- **`capturedThisRun`** in-run guard: an element captured mid-run is never
+  re-resolved later in the same run (fixes the `search_input` bug where a
+  mid-run DB write flipped a "new" element to "existing" and sent it down the
+  resolve path against a navigated page).
+- **Overlay / welcome-popup handling** for the EShopWorld geo modal:
+  graceful dismissal → Escape → hard DOM removal, plus a per-click guard that
+  re-clears the overlay if it re-fires after navigation.
+- **Typed errors** that prevent wasted healing cycles:
+  - `OverlayInterceptError` — locator was correct, a popup blocked the click;
+    don't trigger AI healing.
+  - `CaptureFailedError` — a brand-new element couldn't be captured; there's
+    nothing to heal, so surface the real cause instead of the misleading
+    "No locator data found".
+- `ensureSearchPanelOpen` makes the search-box precondition explicit and
+  idempotent.
+
+### 5. Persistence (`db.ts`, `elementRepo.ts`, `healingRepo.ts`)
+
+- Postgres-backed element store; `saveElement` upserts on `element_name` with
+  `COALESCE(NULLIF(...))` so blank incoming values never wipe existing
+  screenshots/HTML.
+- Append-only `healing_logs` audit of every healing attempt (strategy, status,
+  attempted locators, error).
+
+### 6. Reporting + dashboard (`flowTracker.ts`, `sink.ts`, `SelfHealingReporter.ts`, `renderHtml.ts`)
+
+- Per-element flow tracking across the run, sharded per worker.
+- Reporter merges shards, de-dupes by `elementName`, renders a themed
+  dashboard: resilience ring, tier-distribution bar, per-element expandable
+  tier traces (dark/light).
+- **This PR also unifies the two reporting backends** — the reporter now reads
+  both `flows/` (capture/DB/smart) and `shards/` (AI tier) and normalizes the
+  two flow shapes, so AI-tier flows are no longer dropped from the dashboard.
+
+---
+
+## Validation
+
+- Ann Taylor self-healing funnel spec passes end-to-end (homepage → search →
+  product → PDP), exercising capture, DB/smart resolution, overlay handling,
+  and the search-panel precondition.
