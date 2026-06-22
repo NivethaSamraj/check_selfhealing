@@ -1,0 +1,30 @@
+/* ------------------------------------------------------------------ *
+ *  Shared types for the self-healing flow tracker + dashboard.
+ * ------------------------------------------------------------------ */
+
+export type FlowTier = 'db' | 'smart' | 'ai';
+
+export interface HealStep {
+  /** 1-based order within the element's tier trace. Optional; the renderer
+   *  falls back to array index if absent. */
+  order?: number;
+  tier: FlowTier;
+  action: string;
+  locator?: string;
+  status: 'success' | 'failed' | 'skipped';
+  reason?: string;
+  durationMs?: number;
+}
+
+export interface HealFlow {
+  elementName: string;
+  testTitle: string;
+  url: string;
+  steps: HealStep[];
+  finalTier: FlowTier | null;
+  finalLocator: string | null;
+  healed: boolean;
+  writtenBack: boolean;
+  startedAt?: number;
+  endedAt?: number | null;
+}
