@@ -1,0 +1,643 @@
+import { test, Page, Locator } from '@playwright/test';
+import { allure } from 'allure-playwright';
+import { saveElement, getElement } from '../db/elementRepo';
+import { findWithFallback, buildLocator, isValidLocator } from './fallBackEngine';
+import {
+  buildSmartLocatorBundle,
+  captureElementScreenshot,
+  captureFullPageScreenshot,
+  getElementOuterHTML,
+  getMinimalFullDOM,
+} from '../../utils/selfHealing';
+import { beginFlow, logStep, endFlow } from '../../src/reporting/flowTracker';
+
+/* ------------------------------------------------------------------ *
+ *  Pacing
+ * ------------------------------------------------------------------ */
+export const PACE = { micro: 500, short: 1000, medium: 1500 } as const;
+
+export async function settle(page: Page, ms: number = PACE.short): Promise<void> {
+  await page.waitForTimeout(ms);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Run mode + in-run capture guard
+ *
+ *  CAPTURE_MODE (env CAPTURE_MODE=1): a deliberate "learning" run. Every
+ *  element is captured and acted upon — DB/smart/AI resolution and healing
+ *  are never attempted. Use this for the first dry run against a fresh DB:
+ *      CAPTURE_MODE=1 npx playwright test ...
+ *  With it off, step() behaves normally (capture new elements, resolve/heal
+ *  existing ones).
+ *
+ *  capturedThisRun: even when CAPTURE_MODE is off, an element captured
+ *  earlier in THIS execution must never be re-resolved later in the same
+ *  run. Capture persists the row to the DB mid-run, which would otherwise
+ *  flip the element from "new" to "existing" and send a later evaluation
+ *  down the resolve/heal path against a navigated page (the search_input
+ *  bug). This in-memory set guarantees once-captured-stays-captured for the
+ *  duration of the run.
+ * ------------------------------------------------------------------ */
+export const CAPTURE_MODE: boolean =
+  process.env.CAPTURE_MODE === '1' ||
+  process.env.CAPTURE_MODE === 'true';
+
+const capturedThisRun = new Set<string>();
+
+/** Test hook: clear the in-run capture guard (e.g. in beforeEach). */
+export function resetCaptureGuard(): void {
+  capturedThisRun.clear();
+}
+
+/* ------------------------------------------------------------------ *
+ *  Overlay selectors that intercept pointer events on Ann Taylor
+ *  (EShopWorld welcome / geo modal). Centralised so both the
+ *  upfront dismissal and the per-click guard use the same list.
+ * ------------------------------------------------------------------ */
+const OVERLAY_SELECTOR = 'div.modalBg.welcomeBg, #esw-landing-page';
+
+/* ------------------------------------------------------------------ *
+ *  Hard removal — last-resort DOM teardown of the intercepting
+ *  overlay. EShopWorld geo modals on QA often have no reliable close
+ *  control, so when graceful dismissal fails we detach the nodes and
+ *  re-enable scroll. Best-effort; never throws.
+ * ------------------------------------------------------------------ */
+async function forceRemoveOverlay(page: Page): Promise<void> {
+  await page
+    .evaluate((sel) => {
+      document.querySelectorAll(sel).forEach((el) => el.remove());
+      // Some modals lock the body; restore interaction.
+      document.documentElement.style.overflow = '';
+      document.body.style.overflow = '';
+    }, OVERLAY_SELECTOR)
+    .catch(() => { });
+}
+
+/* ------------------------------------------------------------------ *
+ *  Welcome / interstitial popup dismissal
+ *
+ *  The Ann Taylor (EShopWorld) site shows a welcome modal whose
+ *  backdrop (div.modalBg.welcomeBg) overlays the page and intercepts
+ *  pointer events, causing every subsequent click to time out.
+ *  This closes it if present and waits for the backdrop to detach,
+ *  falling back to hard DOM removal if graceful dismissal fails.
+ *  It is best-effort: if no popup appears, it returns quickly.
+ * ------------------------------------------------------------------ */
+export async function dismissWelcomePopup(
+  page: Page,
+  timeout: number = 8000
+): Promise<void> {
+  const backdrop = page.locator('div.modalBg.welcomeBg');
+
+  // If the backdrop never shows, there is nothing to dismiss.
+  const appeared = await backdrop
+    .first()
+    .waitFor({ state: 'visible', timeout })
+    .then(() => true)
+    .catch(() => false);
+
+  if (!appeared) return;
+
+  // Try the common close affordances in order; stop at the first that works.
+  // #continueButton ("Continue Shopping") is the EShopWorld geo modal's
+  // actual dismiss control on this site — try it first.
+  const closeCandidates: Locator[] = [
+    page.locator('#continueButton'),
+    page.getByRole('button', { name: /continue shopping/i }),
+    page.locator('button.esw-btn'),
+    page.getByRole('button', { name: /close|no thanks|continue|dismiss|shop/i }),
+    page.locator('[aria-label*="close" i]'),
+    page.locator('.modal-close, .close-button, button.close'),
+  ];
+
+  for (const candidate of closeCandidates) {
+    try {
+      if (await candidate.first().isVisible()) {
+        await candidate.first().click({ timeout: 3000 });
+        break;
+      }
+    } catch {
+      /* try the next close affordance */
+    }
+  }
+
+  // As a fallback, press Escape (many modals listen for it).
+  await page.keyboard.press('Escape').catch(() => { });
+
+  // Wait for the intercepting backdrop to actually detach.
+  const gone = await backdrop
+    .first()
+    .waitFor({ state: 'hidden', timeout })
+    .then(() => true)
+    .catch(() => false);
+
+  // Graceful dismissal failed — tear the overlay out of the DOM.
+  if (!gone) {
+    console.log('Welcome popup backdrop still present — forcing DOM removal');
+    await forceRemoveOverlay(page);
+    await backdrop
+      .first()
+      .waitFor({ state: 'hidden', timeout: 2000 })
+      .catch(() => {
+        console.log('Welcome popup backdrop STILL present after force removal');
+      });
+  }
+}
+/* ------------------------------------------------------------------ *
+ *  ensureSearchPanelOpen
+ *
+ *  search_input has a precondition: the search panel must be open for the
+ *  search box to be visible. That precondition was implicitly owned by the
+ *  search_toggle step, but on replay the toggle can resolve in a different
+ *  state (or the page may already have navigated), leaving the box hidden
+ *  and every search_input locator matching 0 visible.
+ *
+ *  This makes the precondition explicit and idempotent: if the search box
+ *  is already visible, do nothing (a second toggle click could CLOSE the
+ *  panel). Otherwise click the search icon and wait for the box to appear.
+ *  Best-effort — never throws; if it cannot open the panel the subsequent
+ *  step will surface the real failure.
+ * ------------------------------------------------------------------ */
+export async function ensureSearchPanelOpen(
+  page: Page,
+  timeout: number = 8000
+): Promise<void> {
+  const searchBox = page.locator('input[name="q"]');
+
+  // Already open and interactable? Nothing to do.
+  const alreadyVisible = await searchBox
+    .filter({ visible: true })
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  if (alreadyVisible) return;
+
+  // Open the panel via the search icon. Try the known id first, then
+  // common fallbacks, stopping at the first that clicks.
+  const toggles: Locator[] = [
+    page.locator('#Sicon'),
+    page.getByRole('button', { name: /search/i }),
+    page.locator('button[aria-label*="search" i]'),
+    page.locator('[data-testid="search-icon"]'),
+  ];
+
+  for (const toggle of toggles) {
+    try {
+      if (await toggle.first().isVisible()) {
+        await toggle.first().click({ timeout: 3000 });
+        break;
+      }
+    } catch {
+      /* try next toggle candidate */
+    }
+  }
+
+  // Wait for the box to become visible after opening.
+  await searchBox
+    .filter({ visible: true })
+    .first()
+    .waitFor({ state: 'visible', timeout })
+    .catch(() => {
+      console.log('ensureSearchPanelOpen: search box did not become visible');
+    });
+}
+
+
+/* ------------------------------------------------------------------ *
+ *  Click/interaction guard
+ *
+ *  These geo modals can re-fire after navigation (PLP/PDP loads),
+ *  so the overlay that was cleared upfront may reappear before a
+ *  later step's click. This wraps an action: if the overlay is
+ *  present it is cleared first, then the action runs. If the action
+ *  still fails because pointer events were intercepted, that is an
+ *  OVERLAY problem (locator was correct) — we surface it as such so
+ *  the caller does NOT mistakenly trigger AI healing.
+ * ------------------------------------------------------------------ */
+export class OverlayInterceptError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OverlayInterceptError';
+  }
+}
+
+
+/* ------------------------------------------------------------------ *
+ *  CaptureFailedError
+ *
+ *  Thrown when a brand-new element (no DB row yet) cannot be captured
+ *  because none of its spec candidates became visible. This must NOT
+ *  fall through to AI healing: there is nothing stored to heal from,
+ *  so healing would only throw the misleading "No locator data found".
+ *  We surface it distinctly so step()'s catch re-throws the real cause.
+ * ------------------------------------------------------------------ */
+export class CaptureFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CaptureFailedError';
+  }
+}
+
+
+async function runActionGuarded(
+  page: Page,
+  loc: Locator,
+  action: (loc: Locator) => Promise<void>
+): Promise<void> {
+  // Pre-emptively clear any re-fired overlay before interacting.
+  if (await page.locator(OVERLAY_SELECTOR).first().isVisible().catch(() => false)) {
+    await dismissWelcomePopup(page, 3000);
+  }
+
+  try {
+    await action(loc);
+  } catch (err: any) {
+    const msg = String(err?.message ?? err);
+    const intercepted = /intercepts pointer events|element is not stable/i.test(msg);
+
+    if (intercepted) {
+      // Locator was fine; an overlay blocked the click. Clear and retry once.
+      await forceRemoveOverlay(page);
+      try {
+        await action(loc);
+        return;
+      } catch (retryErr: any) {
+        throw new OverlayInterceptError(
+          `Action blocked by overlay even after removal: ${String(
+            retryErr?.message ?? retryErr
+          )}`
+        );
+      }
+    }
+
+    throw err;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  First-visible candidate resolver (capture phase)
+ * ------------------------------------------------------------------ */
+export async function firstVisible(
+  page: Page,
+  candidates: Locator[],
+  timeout: number = 8000
+): Promise<Locator> {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    for (const candidate of candidates) {
+      try {
+        if (await candidate.first().isVisible()) {
+          return candidate.first();
+        }
+      } catch {
+        /* keep trying the next candidate */
+      }
+    }
+    await page.waitForTimeout(250);
+  }
+
+  // None of the candidates became visible. Failing loudly here is critical:
+  // returning a fallback element risks capturing the WRONG element (e.g. a
+  // footer field) and permanently poisoning the DB row for this name.
+  throw new Error(
+    `firstVisible: no candidate became visible within ${timeout}ms — ` +
+    `aborting capture to avoid storing the wrong element`
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ *  Baseline capture — persists primary + smart bundle + context
+ * ------------------------------------------------------------------ */
+export async function captureElement(
+  page: Page,
+  elementName: string,
+  locator: Locator,
+  primaryLocatorStr: string
+): Promise<void> {
+  try {
+    await locator.waitFor({ state: 'visible', timeout: 8000 });
+
+    const bundle = await buildSmartLocatorBundle(locator, elementName);
+
+    const [elementShot, fullPageShot, outerHTML, contextDom] = await Promise.all([
+      captureElementScreenshot(locator).catch(() => null),
+      captureFullPageScreenshot(page).catch(() => null),
+      getElementOuterHTML(locator).catch(() => ''),
+      getMinimalFullDOM(page).catch(() => ''),
+    ]);
+
+    await saveElement({
+      elementName,
+      pageUrl: page.url(),
+      primaryLocator: primaryLocatorStr,
+      smartLocators: bundle.smartLocators,
+      meta: bundle.meta,
+      outerHTML,
+      context_dom: contextDom,
+      elementScreenshot: elementShot,
+      fullPageScreenshot: fullPageShot,
+    });
+
+    allure.attachment(
+      'Smart Locators',
+      JSON.stringify(bundle.smartLocators, null, 2),
+      'application/json'
+    );
+    allure.attachment(
+      'Element Metadata',
+      JSON.stringify(bundle.meta, null, 2),
+      'application/json'
+    );
+    allure.attachment('Outer HTML', outerHTML, 'text/html');
+
+    if (elementShot) {
+      allure.attachment('Element Screenshot', Buffer.from(elementShot), 'image/jpeg');
+    }
+    if (fullPageShot) {
+      allure.attachment('Full Page Screenshot', Buffer.from(fullPageShot), 'image/jpeg');
+    }
+
+    console.log(`captured: ${elementName}`);
+  } catch {
+    console.log(`capture failed: ${elementName}`);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  DB / Smart-locator resolution
+ * ------------------------------------------------------------------ */
+type ResolvedLocator = {
+  locator: Locator;
+  strategy: string;
+};
+
+export async function resolveFromDB(
+  page: Page,
+  elementName: string
+): Promise<ResolvedLocator | null> {
+  const row = await getElement(elementName);
+  if (!row) return null;
+
+  // ---- Tier 1: stored primary ----
+  if (row.primary_locator) {
+    const primary = buildLocator(page, row.primary_locator);
+
+    if (primary && (await isValidLocator(primary))) {
+      logStep({
+        tier: 'db',
+        action: 'DB Primary Locator',
+        locator: row.primary_locator,
+        status: 'success',
+      });
+
+      return { locator: primary, strategy: 'db-primary' };
+    }
+
+    logStep({
+      tier: 'db',
+      action: 'DB Primary Locator',
+      locator: row.primary_locator,
+      status: 'failed',
+      reason: 'Primary locator invalid',
+    });
+  }
+
+  // ---- Tier 2: smart locators, in priority order ----
+  const smart =
+    typeof row.smart_locators === 'string'
+      ? JSON.parse(row.smart_locators)
+      : row.smart_locators;
+
+  const priority = [
+    'role',
+    'testId',
+    'label',
+    'placeholder',
+    'text',
+    'alt',
+    'title',
+    'css',
+    'xpath',
+  ];
+
+  for (const key of priority) {
+    const locStr = smart?.[key];
+    if (!locStr) continue;
+
+    const built = buildLocator(page, locStr);
+
+    if (built && (await isValidLocator(built))) {
+      logStep({
+        tier: 'smart',
+        action: `Smart Locator (${key})`,
+        locator: locStr,
+        status: 'success',
+      });
+
+      return { locator: built, strategy: key };
+    }
+  }
+
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ *  step() — capture → DB/smart → AI heal, with flow tracking
+ * ------------------------------------------------------------------ */
+export async function step(
+  page: Page,
+  elementName: string,
+  captureCandidates: Locator[],
+  primaryLocator: string,
+  action: (loc: Locator) => Promise<void>,
+  label: string
+): Promise<void> {
+  beginFlow(elementName, test.info().title, page.url());
+
+  await test
+    .step(label, async () => {
+      const existing = await getElement(elementName);
+
+      // Take the capture/act path (never resolve or heal) when ANY of:
+      //  - the element is brand new (no DB row), OR
+      //  - CAPTURE_MODE is on (deliberate learning run), OR
+      //  - we already captured this element earlier in THIS run (its row was
+      //    persisted mid-run; it must not now be treated as "existing" and
+      //    sent down the resolve/heal path against a navigated page).
+      const captureOnly =
+        !existing || CAPTURE_MODE || capturedThisRun.has(elementName);
+
+      // ---- CAPTURE / ACT PATH ----
+      if (captureOnly) {
+        await test.step('Baseline Capture', async () => {
+          let el: Locator;
+          try {
+            el = await firstVisible(page, captureCandidates);
+          } catch (capErr: any) {
+            // No candidate became visible for a brand-new element. Do NOT
+            // let this reach AI healing (there is no stored row to heal).
+            throw new CaptureFailedError(
+              `Baseline capture failed for "${elementName}": none of the ` +
+              `spec candidates became visible. The element may not have ` +
+              `rendered yet, or the candidates are wrong. ` +
+              `(${capErr?.message ?? capErr})`
+            );
+          }
+
+          // Persist the baseline. When re-running an element that already
+          // exists (CAPTURE_MODE refresh), captureElement simply overwrites.
+          await captureElement(page, elementName, el, primaryLocator);
+
+          // Mark as captured for the rest of this run so a later evaluation
+          // never re-resolves it.
+          capturedThisRun.add(elementName);
+
+          // The element is now captured and stored. If the ACTION fails
+          // after this point (e.g. a timing-sensitive navigation/commit),
+          // we must NOT fall through to AI healing: the row already exists,
+          // the page may have navigated, and healing would run against the
+          // wrong state. Tag the failure so step()'s catch re-throws it.
+          try {
+            await runActionGuarded(page, el, action);
+          } catch (actErr: any) {
+            if (actErr instanceof OverlayInterceptError) throw actErr;
+            throw new CaptureFailedError(
+              `"${elementName}" was captured, but its action failed: ` +
+              `${actErr?.message ?? actErr}`
+            );
+          }
+
+          logStep({
+            tier: 'db',
+            action: 'Primary Locator',
+            locator: primaryLocator,
+            status: 'success',
+          });
+          endFlow({
+            finalTier: 'db',
+            finalLocator: primaryLocator,
+            healed: false,
+            writtenBack: false,
+          });
+        });
+        return;
+      }
+
+      // ---- DB / SMART RESOLUTION ----
+      await test.step('Locator Resolution', async () => {
+        const resolved = await resolveFromDB(page, elementName);
+
+        if (resolved) {
+          await resolved.locator.scrollIntoViewIfNeeded();
+          await runActionGuarded(page, resolved.locator, action);
+
+          const finalTier = resolved.strategy === 'db-primary' ? 'db' : 'smart';
+
+          endFlow({
+            finalTier,
+            finalLocator: resolved.locator.toString(),
+            healed: false,
+            writtenBack: false,
+          });
+
+          // Signal success up the chain so the catch block skips AI healing.
+          throw { success: true };
+        }
+
+        throw new Error('Locator resolution failed');
+      });
+    })
+    .catch(async (e: any) => {
+      if (e?.success) return;
+
+      // Overlay interception means the locator was CORRECT but a popup
+      // blocked the click. AI healing cannot fix this and would waste a
+      // full timeout, so fail loudly with the real cause instead.
+      if (e instanceof OverlayInterceptError) {
+        logStep({
+          tier: 'db',
+          action: 'Action Blocked',
+          status: 'failed',
+          reason: 'Overlay intercepted pointer events',
+        });
+        endFlow({
+          finalTier: 'db',
+          finalLocator: primaryLocator,
+          healed: false,
+          writtenBack: false,
+        });
+        throw e;
+      }
+
+      // A brand-new element that could not be captured has no stored data,
+      // so AI healing is impossible and would only emit the misleading
+      // "No locator data found". Fail with the real capture reason instead.
+      if (e instanceof CaptureFailedError) {
+        logStep({
+          tier: 'db',
+          action: 'Baseline Capture',
+          status: 'failed',
+          reason: e.message,
+        });
+        endFlow({
+          finalTier: null,
+          finalLocator: null,
+          healed: false,
+          writtenBack: false,
+        });
+        throw e;
+      }
+
+      logStep({ tier: 'db', action: 'Locator Resolution', status: 'failed' });
+
+      // ---- AI HEALING ----
+      await test.step(`${elementName} - AI Healing`, async () => {
+        let healed: any;
+
+        await test.step('Generate AI Locator', async () => {
+          healed = await findWithFallback(
+            page,
+            elementName,
+            page.locator('body'),
+            'ann-taylor page'
+          );
+
+          allure.attachment(
+            'Healing Result',
+            JSON.stringify(
+              { element: elementName, strategy: healed.strategy ?? 'AI' },
+              null,
+              2
+            ),
+            'application/json'
+          );
+        });
+
+        await test.step('Validate AI Locator', async () => {
+          if (!(await isValidLocator(healed.locator))) {
+            throw new Error(`Could not heal ${elementName}`);
+          }
+        });
+
+        await test.step('Execute Healed Action', async () => {
+          await healed.locator.scrollIntoViewIfNeeded();
+          await runActionGuarded(page, healed.locator, action);
+
+          logStep({
+            tier: 'ai',
+            action: 'AI Healing',
+            locator: healed.locator.toString(),
+            status: 'success',
+          });
+          endFlow({
+            finalTier: 'ai',
+            finalLocator: healed.locator.toString(),
+            healed: true,
+            writtenBack: true,
+          });
+        });
+      });
+    });
+}
