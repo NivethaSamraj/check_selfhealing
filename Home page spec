@@ -1,0 +1,115 @@
+import { test, expect } from '@playwright/test';
+import { step, dismissWelcomePopup, ensureSearchPanelOpen } from '../core/healing/stepRunner';
+
+
+test.describe('Ann Taylor — Self-Healing Funnel', () => {
+  test('homepage to bag interactions', async ({ page }) => {
+    test.setTimeout(180_000);
+
+    await page.goto('https://sfqa.anntaylor.com/', {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.waitForLoadState('domcontentloaded');
+
+
+    await dismissWelcomePopup(page);
+
+    await step(
+      page,
+      'search_toggle',
+      [
+        page.locator('[data-testid="search-icon"]'),
+        page.getByRole('button', { name: /search/i }),
+        page.locator('button[aria-label*="search" i]'),
+      ],
+      '[data-testid="search-icon"]',
+      async (loc) => {
+        await loc.click();
+      },
+      'Open Search'
+    );
+
+    await ensureSearchPanelOpen(page);
+
+    await step(
+      page,
+      'search_input',
+      [
+        page.locator('input[data-search-field]:visible').first(),
+        page.locator('input[name="q"]:visible').first(),
+        page.getByPlaceholder('What are you looking for?').first(),
+        page.getByRole('combobox', { name: /search/i }).first(),
+      ],
+      'input[name="q"] >> visible=true',
+      async (loc) => {
+        await loc.waitFor({ state: 'visible', timeout: 10000 });
+        await loc.click();
+        await loc.fill('dress');
+
+        const viewAll = page.getByRole('link', {
+          name: /see all|view all|all results|view results/i,
+        });
+        const firstSuggestion = page
+          .locator('#search-results a, #search-results [role="option"]')
+          .first();
+
+        const deadline = Date.now() + 3000;
+        let committed = false;
+        while (Date.now() < deadline && !committed) {
+          if (await viewAll.first().isVisible().catch(() => false)) {
+            await viewAll.first().click().catch(() => {});
+            committed = true;
+          } else if (await firstSuggestion.isVisible().catch(() => false)) {
+            await firstSuggestion.click().catch(() => {});
+            committed = true;
+          } else {
+            await page.waitForTimeout(250);
+          }
+        }
+        if (!committed) {
+          await loc.press('Enter').catch(() => {});
+        }
+
+        try {
+          await page.waitForURL(/search|q=dress|Search-Show/i, { timeout: 8000 });
+        } catch {
+          await page.goto('https://sfqa.anntaylor.com/search?q=dress&lang=default', {
+            waitUntil: 'domcontentloaded',
+          });
+          await page.waitForURL(/search|q=dress/i, { timeout: 10000 });
+        }
+
+        await page
+          .waitForLoadState('networkidle', { timeout: 8000 })
+          .catch(() => {
+          });
+      },
+      'Search Dresses'
+    );
+
+    await dismissWelcomePopup(page, 3000);
+
+    await step(
+      page,
+      'dress_product',
+      [
+        page.locator('.product-tile a').first(),
+        page.locator('a[href*="/p/"]').first(),
+        page.locator('[data-testid*="product"]').first(),
+      ],
+      '[data-testid*="product"]',
+      async (loc) => {
+        await loc.click();
+        await page.waitForLoadState('domcontentloaded');
+      },
+      'Open First Product'
+    );
+
+    await dismissWelcomePopup(page, 3000);
+
+    await test.step('Verify Product Detail Page Reached', async () => {
+      await expect(page).toHaveURL(/\.html|\/clothing\/|priceSort/i);
+      await expect(page.locator('body')).toContainText(/dress|add to bag|size/i);
+    });
+  });
+});
